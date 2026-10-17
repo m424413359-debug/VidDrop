@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from tkinter import filedialog, TclError
+from tkinter import filedialog, messagebox, TclError
 
 import customtkinter as ctk
 from PIL import Image
@@ -120,6 +120,11 @@ TEXTS = {
         "progress": "{p}   •   {speed}   •   متبقٍ {eta}",
         "duration": "المدة",
         "added": "✓ أُضيف إلى القائمة",
+        "ph_video": "الفيديو",
+        "ph_audio": "الصوت",
+        "ph_subs": "تحميل الترجمة…",
+        "confirm_title": "إلغاء التحميل",
+        "confirm_remove": "التحميل لم يكتمل بعد.\nسيُحذف من القائمة وتُحذف كل الملفات التي نزلت منه (فيديو أو صوت أو ترجمة).\n\nهل أنت متأكد؟",
         "count": "{n} عنصر",
         "lang_btn": "English",
         "dark": "داكن",
@@ -182,6 +187,11 @@ TEXTS = {
         "progress": "{p}   •   {speed}   •   {eta} left",
         "duration": "Duration",
         "added": "✓ Added to downloads",
+        "ph_video": "Video",
+        "ph_audio": "Audio",
+        "ph_subs": "Downloading subtitles…",
+        "confirm_title": "Cancel download",
+        "confirm_remove": "This download isn't finished yet.\nIt will be removed from the list and every file downloaded for it (video, audio or subtitles) will be deleted.\n\nAre you sure?",
         "count": "{n} items",
         "lang_btn": "عربي",
         "dark": "Dark",
@@ -309,6 +319,9 @@ class _QuietLogger:
         self.last_error = msg
 
 
+SUB_EXTS = ("vtt", "srt", "ass", "ttml", "srv1", "srv2", "srv3", "json3")
+
+
 class StopRequested(DownloadCancelled):
     msg = "stopped by user"
 
@@ -317,7 +330,7 @@ class StopRequested(DownloadCancelled):
 
 
 class Item:
-    def __init__(self, url, title, opts, status="pending", filepath="", error="", id=None):
+    def __init__(self, url, title, opts, status="pending", filepath="", error="", id=None, files=None):
         self.id = id or uuid.uuid4().hex[:10]
         self.url = url
         self.title = title or url
@@ -329,6 +342,8 @@ class Item:
         self.speed = None
         self.eta = None
         self.retry_in = 0
+        self.phase = ""            # المرحلة الحالية: الفيديو (1/2) / الصوت (2/2) / subs
+        self.files = list(files or [])  # الملفات المؤقتة التي نزلت لهذا العنصر (لحذفها عند الإلغاء)
         self.stop_reason = None    # "pause" | "remove"
         self.widgets = {}
 
@@ -337,7 +352,8 @@ class Item:
         if status in ("downloading", "processing", "retry", "offline"):
             status = "pending"  # عند فتح البرنامج من جديد يكمل من حيث توقف
         return {"id": self.id, "url": self.url, "title": self.title, "opts": self.opts,
-                "status": status, "filepath": self.filepath, "error": self.error}
+                "status": status, "filepath": self.filepath, "error": self.error,
+                "files": self.files}
 
 
 # ─────────────────────────── التطبيق ───────────────────────────
@@ -690,8 +706,10 @@ class VidDropApp(ctk.CTk):
                  "retry": WARNING, "offline": WARNING}.get(st, ACCENT)
         bar.configure(progress_color=color)
 
-        if st == "downloading":
-            txt = self.t("progress", p=f"{it.progress * 100:.1f}%",
+        if st == "downloading" and it.phase == "subs":
+            txt = self.t("ph_subs")
+        elif st == "downloading":
+            txt = (f"{it.phase}   •   " if it.phase else "") + self.t("progress", p=f"{it.progress * 100:.1f}%",
                          speed=(fmt_bytes(it.speed) + "/s") if it.speed else "—", eta=fmt_time(it.eta))
         elif st == "error":
             txt = self.t("st_error", e=it.error)
@@ -965,9 +983,16 @@ class VidDropApp(ctk.CTk):
         self.save_queue()
         self.wake.set()
 
-    def remove_item(self, it):
-        if it.status in ("downloading", "retry", "offline", "processing"):
-            it.stop_reason = "remove"
+    def remove_item(self, it, confirm=True):
+        active = it.status in ("downloading", "retry", "offline", "processing")
+        unfinished = it.status != "done" and (active or it.files)
+        if confirm and unfinished:
+            if not messagebox.askyesno(self.t("confirm_title"), self.t("confirm_remove"), parent=self):
+                return
+        if active:
+            it.stop_reason = "remove"   # عامل التحميل يوقفه ثم يحذف ملفاته
+        elif unfinished:
+            threading.Thread(target=self.delete_item_files, args=(it,), daemon=True).start()
         if it in self.items:
             self.items.remove(it)
         if it.widgets.get("card"):
@@ -978,7 +1003,7 @@ class VidDropApp(ctk.CTk):
 
     def clear_done(self):
         for it in [i for i in self.items if i.status == "done"]:
-            self.remove_item(it)
+            self.remove_item(it, confirm=False)
 
     def toggle_queue(self):
         self.settings["queue_running"] = not self.settings["queue_running"]
@@ -1061,21 +1086,91 @@ class VidDropApp(ctk.CTk):
             opts["postprocessors"] = pps
         return opts
 
+    def _track_file(self, it, path):
+        if path and path not in it.files:
+            it.files.append(path)
+            self.queue_dirty = True
+
     def _progress_hook(self, it, d):
+        """
+        يوتيوب يرسل الجودات العالية كملفين: فيديو بدون صوت + صوت، ثم يدمجهما yt-dlp.
+        نحسب هنا تقدّماً واحداً للملفين معاً حتى لا يبدو أن الفيديو يتحمّل مرتين.
+        """
         if it.stop_reason:
             raise StopRequested()
-        if d.get("status") == "downloading":
+        info = d.get("info_dict") or {}
+        status = d.get("status")
+
+        if status == "downloading":
+            # نسجّل أسماء الملفات التي تنزل فعلاً، لنحذفها إذا ألغى المستخدم التحميل
+            self._track_file(it, d.get("tmpfilename"))
+            self._track_file(it, d.get("filename"))
+
+        # ملف الترجمة: لا يحرّك شريط التقدّم
+        if info.get("ext") in SUB_EXTS and info.get("vcodec") is None and "requested_formats" not in info:
+            if status == "downloading":
+                it.status = "downloading"
+                it.phase = "subs"
+                self.notify(it)
+            return
+
+        parts = info.get("requested_formats") or []
+        ids = [f.get("format_id") for f in parts]
+        idx = ids.index(info.get("format_id")) if info.get("format_id") in ids else 0
+        n = len(parts)
+        sizes = [f.get("filesize") or f.get("filesize_approx") or 0 for f in parts]
+
+        def overall(frac):
+            if n < 2:
+                return frac
+            if all(sizes):
+                return (sum(sizes[:idx]) + frac * sizes[idx]) / sum(sizes)
+            return (idx + frac) / n
+
+        if n >= 2:
+            kind = self.t("ph_audio") if info.get("vcodec") == "none" else self.t("ph_video")
+            it.phase = f"{kind} ({idx + 1}/{n})"
+        else:
+            it.phase = ""
+
+        if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes") or 0
-            it.progress = (done / total) if total else it.progress
+            if total:
+                it.progress = max(it.progress, overall(done / total))
             it.speed = d.get("speed")
             it.eta = d.get("eta")
-            if it.status != "downloading":
-                it.status = "downloading"
+            it.status = "downloading"
             self.notify(it)
-        elif d.get("status") == "finished":
-            it.progress = 1.0
+        elif status == "finished":
+            it.progress = max(it.progress, overall(1.0))
             self.notify(it)
+
+    def delete_item_files(self, it):
+        """يحذف كل ما نزل لعنصر أُلغي: الملفات الجزئية .part وملفات الفيديو/الصوت/الترجمة."""
+        targets = {it.filepath} if it.filepath else set()
+        for f in it.files:
+            targets.update({f, f + ".part", f + ".ytdl"})
+            stem, ext = os.path.splitext(f)
+            if ext.lstrip(".") in SUB_EXTS:  # الترجمة بعد تحويلها لصيغة أخرى (مثلاً vtt → srt)
+                targets.update(stem + "." + e for e in ("srt", "vtt", "ass"))
+            folder, base = os.path.split(f)
+            try:
+                for name in os.listdir(folder or "."):
+                    if name.startswith(base + ".part-Frag") or name.startswith(base + "-Frag"):
+                        targets.add(os.path.join(folder, name))
+            except OSError:
+                pass
+        for path in targets:
+            for _ in range(10):  # ويندوز قد يُبقي الملف مقفولاً لحظات بعد الإيقاف
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    break
+                except OSError:
+                    time.sleep(0.5)
+        it.files = []
+        it.filepath = ""
 
     def _pp_hook(self, it, d):
         if d.get("status") == "started" and it.status != "processing":
@@ -1098,6 +1193,7 @@ class VidDropApp(ctk.CTk):
         it.status = "downloading"
         it.error = ""
         it.progress = 0.0
+        it.phase = ""
         self.notify(it)
         failures = 0
         while True:
@@ -1108,6 +1204,7 @@ class VidDropApp(ctk.CTk):
                     raise DownloadError("download failed")
                 it.status = "done"
                 it.progress = 1.0
+                it.files = []   # اكتمل: الملفات المؤقتة حذفها yt-dlp بعد الدمج
                 break
             except DownloadCancelled:
                 break
@@ -1134,7 +1231,10 @@ class VidDropApp(ctk.CTk):
 
         if it.stop_reason == "pause":
             it.status = "paused"
+        elif it.stop_reason == "remove":
+            self.delete_item_files(it)
         it.stop_reason = None
+        it.phase = ""
         it.speed = it.eta = None
         self.notify(it)
         self.queue_dirty = True
