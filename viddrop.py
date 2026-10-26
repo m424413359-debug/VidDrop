@@ -9,6 +9,7 @@ A modern GUI for yt-dlp (CustomTkinter)
   • استئناف تلقائي عند انقطاع الإنترنت، وحفظ القائمة عند إغلاق البرنامج
   • مراقبة الحافظة: انسخ رابطاً من المتصفح فيظهر لك اقتراح التحميل
   • واجهة عربية / إنجليزية، ووضع داكن / فاتح
+  • تحديث البرنامج من داخله عند صدور نسخة جديدة على GitHub
 """
 
 import io
@@ -24,6 +25,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import webbrowser
 from tkinter import filedialog, messagebox, TclError
 
 import customtkinter as ctk
@@ -34,9 +36,15 @@ from yt_dlp.utils import DownloadCancelled, DownloadError
 # ─────────────────────────── إعدادات عامة ───────────────────────────
 
 APP_NAME = "VidDrop"
+APP_VERSION = "1.2"
+GITHUB_REPO = "m424413359-debug/VidDrop"
+UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+IS_FROZEN = getattr(sys, "frozen", False)  # True عند التشغيل كـ VidDrop.exe
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".viddrop")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 QUEUE_FILE = os.path.join(CONFIG_DIR, "queue.json")
+UPDATE_DIR = os.path.join(CONFIG_DIR, "update")
 DEFAULT_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads", "VidDrop")
 
 ACCENT = "#7C5CFF"
@@ -58,6 +66,7 @@ DEFAULT_SETTINGS = {
     "clipboard": True,
     "queue_running": True,
     "quick_quality": "1080",
+    "auto_update_check": True,
 }
 
 # ─────────────────────────── النصوص (عربي / إنجليزي) ───────────────────────────
@@ -129,6 +138,22 @@ TEXTS = {
         "lang_btn": "English",
         "dark": "داكن",
         "light": "فاتح",
+        "upd_auto": "افحص التحديثات تلقائياً",
+        "upd_available": "نسخة جديدة متوفرة: v{v}",
+        "upd_notes": "ما الجديد؟",
+        "upd_install": "تحديث",
+        "upd_page": "افتح صفحة التحميل",
+        "upd_later": "لاحقاً",
+        "upd_downloading": "جارٍ تنزيل التحديث v{v}…   {p}",
+        "upd_failed": "توقف تنزيل التحديث: {e}",
+        "upd_retry": "حاول مجدداً",
+        "upd_bad_size": "الملف الذي نزل ناقص",
+        "upd_ready": "التحديث v{v} جاهز ✓ — أعد تشغيل البرنامج لتثبيته",
+        "upd_restart": "أعد التشغيل الآن",
+        "upd_notes_title": "ما الجديد في v{v}",
+        "upd_no_notes": "لا توجد ملاحظات لهذه النسخة.",
+        "upd_confirm_title": "إعادة التشغيل للتحديث",
+        "upd_confirm": "هناك تحميل جارٍ الآن.\nسيتوقف، ثم يكمل من حيث توقف بعد فتح النسخة الجديدة.\n\nهل تريد المتابعة؟",
     },
     "en": {
         "subtitle": "Download your videos in the quality you want — effortlessly",
@@ -196,6 +221,22 @@ TEXTS = {
         "lang_btn": "عربي",
         "dark": "Dark",
         "light": "Light",
+        "upd_auto": "Check for updates",
+        "upd_available": "A new version is available: v{v}",
+        "upd_notes": "What's new?",
+        "upd_install": "Update",
+        "upd_page": "Open download page",
+        "upd_later": "Later",
+        "upd_downloading": "Downloading update v{v}…   {p}",
+        "upd_failed": "Update download stopped: {e}",
+        "upd_retry": "Try again",
+        "upd_bad_size": "the downloaded file is incomplete",
+        "upd_ready": "Update v{v} is ready ✓ — restart the app to install it",
+        "upd_restart": "Restart now",
+        "upd_notes_title": "What's new in v{v}",
+        "upd_no_notes": "No notes for this version.",
+        "upd_confirm_title": "Restart to update",
+        "upd_confirm": "A download is running right now.\nIt will stop, then continue where it left off once the new version opens.\n\nContinue?",
     },
 }
 
@@ -300,6 +341,58 @@ def save_json(path, data):
         pass
 
 
+def parse_version(v):
+    """'v1.2' → (1, 2, 0) — لمقارنة أرقام النسخ."""
+    nums = [int(n) for n in re.findall(r"\d+", v or "")[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def fetch_latest_release():
+    """يرجع معلومات آخر نسخة على GitHub، أو None إن لم تكن أحدث من النسخة الحالية."""
+    req = urllib.request.Request(UPDATE_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.load(r)
+    tag = data.get("tag_name") or ""
+    if parse_version(tag) <= parse_version(APP_VERSION):
+        return None
+    asset = next((a for a in data.get("assets", []) if a.get("name", "").lower() == "viddrop.exe"), None)
+    return {
+        "version": tag.lstrip("vV"),
+        "notes": (data.get("body") or "").strip(),
+        "url": asset["browser_download_url"] if asset else "",
+        "size": asset.get("size", 0) if asset else 0,
+    }
+
+
+# يستبدل VidDrop.exe بعد إغلاق البرنامج:  %1 = البرنامج الحالي، %2 = النسخة الجديدة
+UPDATER_BAT = r"""@echo off
+set "OLD=%~1"
+set "NEW=%~2"
+set "BAK=%~dpn1.old.exe"
+set /a N=0
+:wait
+move /y "%OLD%" "%BAK%" >nul 2>&1 && goto swap
+set /a N+=1
+if %N% geq 30 goto run
+ping -n 2 127.0.0.1 >nul
+goto wait
+:swap
+move /y "%NEW%" "%OLD%" >nul 2>&1 || move /y "%BAK%" "%OLD%" >nul 2>&1
+:run
+start "" "%OLD%"
+(goto) 2>nul & del "%~f0"
+"""
+
+
+def child_env():
+    """بيئة نظيفة لتشغيل النسخة الجديدة — بدون متغيرات PyInstaller الخاصة بالنسخة الحالية."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith(("_PYI", "_MEI")) and k.upper() not in ("TCL_LIBRARY", "TK_LIBRARY")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 class _QuietLogger:
     """يمنع yt-dlp من طباعة الرسائل في الطرفية ويحتفظ بآخر خطأ."""
 
@@ -387,6 +480,12 @@ class VidDropApp(ctk.CTk):
         self.extractors = None
         self.toast = None
         self.thumb_image = None
+        self.update_info = None    # معلومات النسخة الجديدة إن وُجدت
+        self.update_stage = ""     # available / downloading / failed / ready
+        self.update_hidden = False
+        self.update_text = ""
+        self.update_frac = 0.0
+        self.update_file = ""
 
         self.build_ui()
         self.wake.set()
@@ -395,6 +494,13 @@ class VidDropApp(ctk.CTk):
         threading.Thread(target=self._load_extractors, daemon=True).start()
         self.after(120, self.poll_events)
         self.after(1200, self.poll_clipboard)
+        if self.settings["auto_update_check"]:
+            self.after(3000, self.start_update_check)
+        if IS_FROZEN:  # حذف النسخة القديمة التي تركها التحديث السابق
+            try:
+                os.remove(os.path.splitext(sys.executable)[0] + ".old.exe")
+            except OSError:
+                pass
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ───── أدوات ─────
@@ -455,6 +561,8 @@ class VidDropApp(ctk.CTk):
 
         body = ctk.CTkFrame(root, fg_color="transparent")
         body.pack(fill="both", expand=True, pady=(14, 0))
+        self.body = body
+        self.render_update_bar()
         left_col, right_col = (1, 0) if self.rtl else (0, 1)
         body.grid_columnconfigure(left_col, weight=5, uniform="c")
         body.grid_columnconfigure(right_col, weight=6, uniform="c")
@@ -484,7 +592,11 @@ class VidDropApp(ctk.CTk):
 
         titles = ctk.CTkFrame(head, fg_color="transparent")
         titles.pack(side=self.side, padx=12)
-        ctk.CTkLabel(titles, text=APP_NAME, font=self.font(24, "bold"), anchor=self.anchor).pack(fill="x")
+        name_row = ctk.CTkFrame(titles, fg_color="transparent")
+        name_row.pack(fill="x")
+        ctk.CTkLabel(name_row, text=APP_NAME, font=self.font(24, "bold")).pack(side=self.side)
+        ctk.CTkLabel(name_row, text=f"v{APP_VERSION}", font=self.font(12), text_color=MUTED).pack(
+            side=self.side, padx=6, pady=(8, 0))
         ctk.CTkLabel(titles, text=self.t("subtitle"), font=self.font(12), text_color=MUTED,
                      anchor=self.anchor).pack(fill="x")
 
@@ -498,6 +610,10 @@ class VidDropApp(ctk.CTk):
         self.theme_seg.set(self.t("dark") if self.settings["appearance"] == "dark" else self.t("light"))
         self.theme_seg.pack(side=self.opp, padx=10)
 
+        self.upd_auto_var = ctk.BooleanVar(value=self.settings["auto_update_check"])
+        ctk.CTkSwitch(head, text=self.t("upd_auto"), variable=self.upd_auto_var, font=self.font(12),
+                      progress_color=ACCENT, command=self.on_update_toggle).pack(side=self.opp, padx=6)
+
         warnings = []
         if not self.ffmpeg:
             warnings.append(self.t("ffmpeg_missing"))
@@ -506,6 +622,8 @@ class VidDropApp(ctk.CTk):
         for w in warnings:
             ctk.CTkLabel(root, text=w, font=self.font(12), text_color=WARNING,
                          anchor=self.anchor).pack(fill="x", pady=(8, 0))
+
+        self.update_bar = ctk.CTkFrame(root, fg_color=CARD, corner_radius=12)  # يظهر عند وجود تحديث
 
     def _build_form(self, form):
         # بطاقة الرابط
@@ -1252,6 +1370,8 @@ class VidDropApp(ctk.CTk):
                     self.on_fetched(*ev[1:])
                 elif kind == "fetch_error":
                     self.on_fetch_error(*ev[1:])
+                elif kind == "update":
+                    self.on_update_event(*ev[1:])
         except queue.Empty:
             pass
         for it in self.dirty:
@@ -1355,6 +1475,179 @@ class VidDropApp(ctk.CTk):
                 self.queue_dirty = True
         except Exception:
             pass
+
+    # ───── التحديثات ─────
+
+    def on_update_toggle(self):
+        self.settings["auto_update_check"] = bool(self.upd_auto_var.get())
+        self.save_settings()
+        if self.settings["auto_update_check"] and not self.update_stage:
+            self.start_update_check()
+
+    def start_update_check(self):
+        threading.Thread(target=self._check_update_thread, daemon=True).start()
+
+    def update_paths(self, info):
+        done = os.path.join(UPDATE_DIR, f"VidDrop-{info['version']}.exe")
+        return done, done + ".part"
+
+    def _check_update_thread(self):
+        try:
+            info = fetch_latest_release()
+        except Exception:
+            return  # لا إنترنت أو GitHub لا يرد — نحاول بصمت في المرة القادمة
+        keep = os.path.basename(self.update_paths(info)[0]) if info else None
+        try:  # حذف ملفات تحديثات قديمة لم تعد لازمة
+            for name in os.listdir(UPDATE_DIR):
+                if not keep or not name.startswith(keep):
+                    os.remove(os.path.join(UPDATE_DIR, name))
+        except OSError:
+            pass
+        if info:
+            self.ui_events.put(("update", "available", info))
+
+    def start_update_download(self):
+        if self.update_stage == "downloading":
+            return
+        self.update_stage = "downloading"
+        self.update_frac = 0.0
+        self.update_text = ""
+        self.render_update_bar()
+        threading.Thread(target=self._download_update_thread, args=(self.update_info,), daemon=True).start()
+
+    def _download_update_thread(self, info):
+        done, part = self.update_paths(info)
+        total = info["size"]
+        try:
+            os.makedirs(UPDATE_DIR, exist_ok=True)
+            if os.path.isfile(done) and (not total or os.path.getsize(done) == total):
+                self.ui_events.put(("update", "ready", done))  # نزل كاملاً من قبل
+                return
+            have = os.path.getsize(part) if os.path.isfile(part) else 0
+            if total and have > total:
+                have = 0
+            if not (total and have == total):
+                headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+                if have:
+                    headers["Range"] = f"bytes={have}-"  # يكمل من حيث توقف
+                req = urllib.request.Request(info["url"], headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    if have and r.status != 206:
+                        have = 0  # السيرفر لم يقبل الاستكمال — نبدأ من جديد
+                    total = total or have + int(r.headers.get("Content-Length") or 0)
+                    last = 0
+                    with open(part, "ab" if have else "wb") as f:
+                        while True:
+                            chunk = r.read(64 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            have += len(chunk)
+                            if time.time() - last > 0.3:
+                                last = time.time()
+                                self.ui_events.put(("update", "progress", (have, total)))
+            size = os.path.getsize(part)
+            if info["size"] and size != info["size"]:
+                if size > info["size"]:
+                    os.remove(part)
+                raise IOError(self.t("upd_bad_size"))
+            os.replace(part, done)
+            self.ui_events.put(("update", "ready", done))
+        except Exception as e:
+            self.ui_events.put(("update", "failed", clean_error(e)))
+
+    def on_update_event(self, stage, data):
+        if stage == "progress":
+            have, total = data
+            self.update_frac = have / total if total else 0.0
+            self.update_text = f"{self.update_frac * 100:.0f}%   ({fmt_bytes(have)} / {fmt_bytes(total)})"
+            if self.update_stage == "downloading" and self.upd_progress:
+                try:
+                    self.upd_label.configure(text=self.t("upd_downloading", v=self.update_info["version"],
+                                                         p=self.update_text))
+                    self.upd_progress.set(self.update_frac)
+                except TclError:
+                    pass
+            return
+        if stage == "available":
+            if self.update_stage:
+                return
+            self.update_info = data
+            done = self.update_paths(data)[0]
+            if IS_FROZEN and data["url"] and os.path.isfile(done) and \
+                    (not data["size"] or os.path.getsize(done) == data["size"]):
+                stage, self.update_file = "ready", done  # نزل في مرة سابقة
+        elif stage == "failed":
+            self.update_text = data
+        elif stage == "ready":
+            self.update_file = data
+        self.update_stage = stage
+        self.render_update_bar()
+
+    def render_update_bar(self):
+        bar = self.update_bar
+        for w in bar.winfo_children():
+            w.destroy()
+        self.upd_label = self.upd_progress = None
+        if not self.update_stage or self.update_hidden:
+            bar.pack_forget()
+            return
+        bar.pack(fill="x", pady=(10, 0), before=self.body)
+
+        st, v = self.update_stage, self.update_info["version"]
+        row = ctk.CTkFrame(bar, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=10)
+
+        if st != "downloading":
+            self.small_btn(row, self.t("upd_later"), self.hide_update_bar)
+        if st == "available":
+            if IS_FROZEN and self.update_info["url"]:
+                self.small_btn(row, self.t("upd_install"), self.start_update_download, ACCENT)
+            else:
+                self.small_btn(row, self.t("upd_page"), lambda: webbrowser.open(RELEASES_PAGE), ACCENT)
+            self.small_btn(row, self.t("upd_notes"), self.show_update_notes)
+            text, color = self.t("upd_available", v=v), ACCENT
+        elif st == "downloading":
+            text, color = self.t("upd_downloading", v=v, p=self.update_text), None
+        elif st == "failed":
+            self.small_btn(row, self.t("upd_retry"), self.start_update_download, ACCENT)
+            text, color = self.t("upd_failed", e=self.update_text), DANGER
+        else:
+            self.small_btn(row, self.t("upd_restart"), self.install_update, SUCCESS)
+            text, color = self.t("upd_ready", v=v), SUCCESS
+
+        self.upd_label = ctk.CTkLabel(row, text=text, font=self.font(13, "bold"), text_color=color,
+                                      anchor=self.anchor)
+        self.upd_label.pack(side=self.side, fill="x", expand=True)
+        if st == "downloading":
+            self.upd_progress = ctk.CTkProgressBar(bar, height=8, progress_color=ACCENT)
+            self.upd_progress.set(self.update_frac)
+            self.upd_progress.pack(fill="x", padx=14, pady=(0, 12))
+
+    def hide_update_bar(self):
+        self.update_hidden = True
+        self.render_update_bar()
+
+    def show_update_notes(self):
+        info = self.update_info
+        messagebox.showinfo(self.t("upd_notes_title", v=info["version"]),
+                            info["notes"] or self.t("upd_no_notes"), parent=self)
+
+    def install_update(self):
+        busy = any(i.status in ("downloading", "processing") for i in self.items)
+        if busy and not messagebox.askyesno(self.t("upd_confirm_title"), self.t("upd_confirm"), parent=self):
+            return
+        try:
+            bat = os.path.join(UPDATE_DIR, "update.bat")
+            with open(bat, "w", encoding="ascii", newline="\r\n") as f:
+                f.write(UPDATER_BAT)
+            # الأقواس الخارجية الإضافية لأن cmd /c يحذف أول وآخر علامة تنصيص
+            subprocess.Popen(f'cmd /c ""{bat}" "{sys.executable}" "{self.update_file}""',
+                             env=child_env(), creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except Exception as e:
+            self.on_update_event("failed", clean_error(e))
+            return
+        self.on_close()
 
     # ───── الإغلاق ─────
 

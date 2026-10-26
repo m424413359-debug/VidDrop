@@ -1,0 +1,70 @@
+# يبني VidDrop.exe وينشره كـ Release كلما رُفع tag يبدأ بـ v (مثل v1.2)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tag matches APP_VERSION
+        shell: python
+        run: |
+          import os, re, sys
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("vV")
+          src = open("viddrop.py", encoding="utf-8").read()
+          m = re.search(r'^APP_VERSION = "([^"]+)"', src, re.M)
+          version = m.group(1) if m else None
+          if version != tag:
+              print(f"::error::Tag v{tag} does not match APP_VERSION = {version!r} in viddrop.py")
+              sys.exit(1)
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Make icon
+        run: python make_icon.py
+
+      - name: Build VidDrop.exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name VidDrop --icon icon.ico
+          --collect-all customtkinter
+          --collect-all imageio_ffmpeg
+          --collect-all yt_dlp_ejs
+          --collect-submodules yt_dlp
+          viddrop.py
+
+      - name: Release notes from CHANGELOG
+        shell: python
+        run: |
+          import os, re
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("vV")
+          notes, inside = [], False
+          for line in open("CHANGELOG.txt", encoding="utf-8").read().splitlines():
+              if re.match(r"^v\d", line.strip()):
+                  inside = line.strip() == f"v{tag}"
+              elif inside:
+                  notes.append(line)
+          text = "\n".join(notes).strip() or f"VidDrop v{tag}"
+          open("notes.md", "w", encoding="utf-8").write(text + "\n")
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/VidDrop.exe --title "VidDrop ${{ github.ref_name }}" --notes-file notes.md
