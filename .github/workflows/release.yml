@@ -1,0 +1,97 @@
+# يبني VidDrop.exe ويختبره على Windows، وينشره كـ Release:
+#  • push على main: إذا لم يكن هناك Release لرقم APP_VERSION بعد ← يبني، يختبر، ينشئ الـ tag والـ Release
+#  • tag يبدأ بـ v: نفس الشيء (ويتأكد أن الـ tag يطابق APP_VERSION)
+#  • pull request: يبني ويختبر فقط، بدون نشر
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read version
+        id: ver
+        shell: python
+        run: |
+          import os, re, subprocess, sys
+          src = open("viddrop.py", encoding="utf-8").read()
+          m = re.search(r'^APP_VERSION = "([^"]+)"', src, re.M)
+          if not m:
+              print("::error::APP_VERSION not found in viddrop.py"); sys.exit(1)
+          version = m.group(1)
+          tag = "v" + version
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/") and ref != "refs/tags/" + tag:
+              print(f"::error::Tag {os.environ['GITHUB_REF_NAME']} does not match APP_VERSION = {version}"); sys.exit(1)
+          exists = subprocess.run(["gh", "release", "view", tag], capture_output=True).returncode == 0
+          is_pr = os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+          publish = not is_pr and not exists
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\ntag={tag}\n")
+              f.write(f"build={'true' if is_pr or publish else 'false'}\npublish={'true' if publish else 'false'}\n")
+          print(f"APP_VERSION {version} | release {tag} exists: {exists} | publish: {publish}")
+
+      - name: Install dependencies
+        if: steps.ver.outputs.build == 'true'
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Make icon
+        if: steps.ver.outputs.build == 'true'
+        run: python make_icon.py
+
+      - name: Build VidDrop.exe
+        if: steps.ver.outputs.build == 'true'
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name VidDrop --icon icon.ico
+          --collect-all customtkinter
+          --collect-all imageio_ffmpeg
+          --collect-all yt_dlp_ejs
+          --collect-submodules yt_dlp
+          viddrop.py
+
+      - name: Test on Windows (starts, downloads update, swaps, relaunches)
+        if: steps.ver.outputs.build == 'true'
+        timeout-minutes: 10
+        run: python .github/scripts/test_windows.py
+
+      - name: Release notes from CHANGELOG
+        if: steps.ver.outputs.publish == 'true'
+        shell: python
+        run: |
+          import os, re
+          tag = os.environ["TAG"]
+          notes, inside = [], False
+          for line in open("CHANGELOG.txt", encoding="utf-8").read().splitlines():
+              if re.match(r"^v\d", line.strip()):
+                  inside = line.strip() == tag
+              elif inside:
+                  notes.append(line)
+          text = "\n".join(notes).strip() or "VidDrop " + tag
+          open("notes.md", "w", encoding="utf-8").write(text + "\n")
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+
+      - name: Publish release
+        if: steps.ver.outputs.publish == 'true'
+        run: gh release create "${{ steps.ver.outputs.tag }}" dist/VidDrop.exe --target "${{ github.sha }}" --title "VidDrop ${{ steps.ver.outputs.tag }}" --notes-file notes.md
