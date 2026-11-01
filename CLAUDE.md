@@ -9,7 +9,8 @@ Ahmed is a CS student in Gaza; talk to him in Arabic (Palestinian dialect is fin
 - `requirements.txt` — `yt-dlp[default]`, `customtkinter`, `pillow`, `imageio-ffmpeg`
 - `setup.bat` / `run.bat` / `run_debug.bat` / `update.bat` — Windows helpers for running from source
 - `build_exe.bat` + `make_icon.py` — local PyInstaller build (kept for local builds)
-- `.github/workflows/release.yml` — on tag `v*`: checks tag == `APP_VERSION`, builds `VidDrop.exe`, publishes a GitHub Release with the CHANGELOG notes
+- `.github/workflows/release.yml` — builds `VidDrop.exe` on windows-latest, runs `.github/scripts/test_windows.py`
+  (exe starts; update download → swap while running → relaunch), then publishes the Release (see Release process)
 - `CHANGELOG.txt` — one entry per version (Arabic)
 
 ## Working rules (agreed with Ahmed — follow strictly)
@@ -27,13 +28,15 @@ Ahmed is a CS student in Gaza; talk to him in Arabic (Palestinian dialect is fin
   (Background: YouTube sends HD as separate video + audio. In v1.0 each part had its own bar, so Ahmed
   thought the audio part was a duplicate and cancelled it → videos without sound.)
 
-- **v1.2** — in-app updates (code written; waiting for Ahmed to test, then tag). Details below.
+- **v1.2** — in-app updates, released automatically from `main`. Details below.
 
 ## Release process
 - Repo is **public** (`m424413359-debug/VidDrop`), default branch `main`.
-- Claude's cloud session can push only its own branch — **it cannot push tags**. Ahmed pushes tags from his laptop:
-  `git tag vX.Y` → `git push origin vX.Y` → GitHub Actions builds and publishes the Release.
-- Bump `APP_VERSION` in `viddrop.py` and add a CHANGELOG entry before tagging (the workflow fails if they don't match).
+- Claude's cloud session can push only its own branch — **it cannot push tags**. So releases are automatic:
+  when a push to `main` carries an `APP_VERSION` that has no Release yet, the workflow builds, tests,
+  and creates the tag `vX.Y` + the Release itself. Nobody needs to push tags (pushing one still works).
+- A new version = bump `APP_VERSION` + add a CHANGELOG entry (notes are taken from it) → PR → merge to `main`.
+- Pull requests run the build + Windows tests without publishing — check them before merging.
 
 ## v1.2 — in-app updates (as implemented)
 - `APP_VERSION` constant, shown next to the app name.
