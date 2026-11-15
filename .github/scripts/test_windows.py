@@ -123,8 +123,10 @@ for _ in range(60):
     if not os.path.exists(new_file) and new_pids:
         break
 else:
+    log = os.path.join(HOME, ".viddrop", "error.log")
     fail(f"swap did not finish: new_file_left={os.path.exists(new_file)} "
-         f"new_process={bool(viddrop_pids() - old_pids)} files={os.listdir(APP_DIR)}")
+         f"new_process={bool(viddrop_pids() - old_pids)} files={os.listdir(APP_DIR)} "
+         f"error.log={open(log, encoding='utf-8').read() if os.path.exists(log) else 'none'}")
 print("3b) exe swapped and the new version launched")
 
 time.sleep(20)

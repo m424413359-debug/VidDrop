@@ -348,16 +348,25 @@ def log_error(text):
         pass
 
 
-def already_running():
-    """True إذا كانت نسخة أخرى من البرنامج مفتوحة (Windows) — ويُظهر نافذتها."""
+def already_running(wait=0):
+    """
+    True إذا كانت نسخة أخرى من البرنامج مفتوحة (Windows) — ويُظهر نافذتها.
+    wait: ثوانٍ ننتظر فيها إغلاق النسخة الأخرى (بعد التحديث تبدأ النسخة الجديدة والقديمة ما زالت تُغلق).
+    """
     if not IS_WINDOWS:
         return False
     import ctypes
     global _instance_mutex
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _instance_mutex = kernel32.CreateMutexW(None, False, "VidDrop_single_instance")
-    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
-        return False
+    deadline = time.time() + wait
+    while True:
+        _instance_mutex = kernel32.CreateMutexW(None, False, "VidDrop_single_instance")
+        if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+            return False
+        if time.time() >= deadline:
+            break
+        kernel32.CloseHandle(_instance_mutex)
+        time.sleep(0.5)
     user32 = ctypes.windll.user32
     hwnd = user32.FindWindowW(None, APP_NAME)
     if hwnd:
@@ -513,7 +522,7 @@ goto wait
 :swap
 move /y "%NEW%" "%OLD%" >nul 2>&1 || move /y "%BAK%" "%OLD%" >nul 2>&1
 :run
-start "" "%OLD%"
+start "" "%OLD%" --updated
 (goto) 2>nul & del "%~f0"
 """
 
@@ -1964,7 +1973,7 @@ def main():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     threading.excepthook = lambda a: log_error(
         "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
-    if already_running():
+    if already_running(wait=20 if "--updated" in sys.argv else 0):
         return
     VidDropApp().mainloop()
 
