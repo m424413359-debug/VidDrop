@@ -10,6 +10,7 @@ A modern GUI for yt-dlp (CustomTkinter)
   • مراقبة الحافظة: انسخ رابطاً من المتصفح فيظهر لك اقتراح التحميل
   • واجهة عربية / إنجليزية، ووضع داكن / فاتح
   • تحديث البرنامج من داخله عند صدور نسخة جديدة على GitHub
+  • يجهّز نفسه على أي جهاز Windows: ينزّل Deno (مطلوب ليوتيوب) تلقائياً في أول تشغيل
 """
 
 import io
@@ -21,11 +22,15 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
+import urllib.error
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 from tkinter import filedialog, messagebox, TclError
 
 import customtkinter as ctk
@@ -36,15 +41,28 @@ from yt_dlp.utils import DownloadCancelled, DownloadError
 # ─────────────────────────── إعدادات عامة ───────────────────────────
 
 APP_NAME = "VidDrop"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 GITHUB_REPO = "m424413359-debug/VidDrop"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+DENO_URL = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
 IS_FROZEN = getattr(sys, "frozen", False)  # True عند التشغيل كـ VidDrop.exe
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".viddrop")
-SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-QUEUE_FILE = os.path.join(CONFIG_DIR, "queue.json")
-UPDATE_DIR = os.path.join(CONFIG_DIR, "update")
+IS_WINDOWS = sys.platform.startswith("win")
+NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW — لا تظهر نافذة سوداء عند تشغيل برنامج مساعد
+
+
+def set_config_dir(path):
+    """مكان الإعدادات والقائمة والملفات المساعدة (~/.viddrop)."""
+    global CONFIG_DIR, SETTINGS_FILE, QUEUE_FILE, UPDATE_DIR, BIN_DIR, ERROR_LOG
+    CONFIG_DIR = path
+    SETTINGS_FILE = os.path.join(path, "settings.json")
+    QUEUE_FILE = os.path.join(path, "queue.json")
+    UPDATE_DIR = os.path.join(path, "update")
+    BIN_DIR = os.path.join(path, "bin")      # Deno الذي ينزّله البرنامج
+    ERROR_LOG = os.path.join(path, "error.log")
+
+
+set_config_dir(os.path.join(os.path.expanduser("~"), ".viddrop"))
 DEFAULT_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads", "VidDrop")
 
 ACCENT = "#7C5CFF"
@@ -125,7 +143,9 @@ TEXTS = {
         "fetch_fail": "تعذّر جلب المعلومات: {e}",
         "playlist": "هذا رابط قائمة تشغيل — الإصدار الحالي يدعم الفيديو الواحد.",
         "ffmpeg_missing": "تنبيه: FFmpeg غير موجود — الجودات العالية وتحويل MP3 ودمج الترجمة لن تعمل.",
-        "deno_missing": "تنبيه: Deno غير مثبّت — قد لا تظهر كل الجودات من يوتيوب. شغّل setup.bat",
+        "deno_missing": "تنبيه: Deno غير مثبّت — قد لا تظهر كل الجودات من يوتيوب.",
+        "deno_downloading": "تجهيز لمرة واحدة: تنزيل مكوّن يوتيوب (Deno)…   {p}",
+        "deno_failed": "تعذّر تنزيل مكوّن يوتيوب — قد لا تظهر كل الجودات",
         "progress": "{p}   •   {speed}   •   متبقٍ {eta}",
         "duration": "المدة",
         "added": "✓ أُضيف إلى القائمة",
@@ -138,7 +158,7 @@ TEXTS = {
         "lang_btn": "English",
         "dark": "داكن",
         "light": "فاتح",
-        "upd_auto": "افحص التحديثات تلقائياً",
+        "upd_auto": "تحديث تلقائي",
         "upd_available": "نسخة جديدة متوفرة: v{v}",
         "upd_notes": "ما الجديد؟",
         "upd_install": "تحديث",
@@ -208,7 +228,9 @@ TEXTS = {
         "fetch_fail": "Couldn't fetch info: {e}",
         "playlist": "This is a playlist link — this version supports single videos.",
         "ffmpeg_missing": "Warning: FFmpeg not found — high qualities, MP3 and embedded subtitles won't work.",
-        "deno_missing": "Warning: Deno is not installed — some YouTube qualities may be missing. Run setup.bat",
+        "deno_missing": "Warning: Deno is not installed — some YouTube qualities may be missing.",
+        "deno_downloading": "One-time setup: downloading the YouTube component (Deno)…   {p}",
+        "deno_failed": "Couldn't download the YouTube component — some qualities may be missing",
         "progress": "{p}   •   {speed}   •   {eta} left",
         "duration": "Duration",
         "added": "✓ Added to downloads",
@@ -221,7 +243,7 @@ TEXTS = {
         "lang_btn": "عربي",
         "dark": "Dark",
         "light": "Light",
-        "upd_auto": "Check for updates",
+        "upd_auto": "Auto-update",
         "upd_available": "A new version is available: v{v}",
         "upd_notes": "What's new?",
         "upd_install": "Update",
@@ -253,6 +275,117 @@ def find_ffmpeg():
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return None
+
+
+def find_deno():
+    """Deno المثبّت في النظام، أو الذي نزّله البرنامج في ~/.viddrop/bin."""
+    path = shutil.which("deno")
+    if path:
+        return path
+    local = os.path.join(BIN_DIR, "deno.exe")
+    return local if os.path.isfile(local) else None
+
+
+def download_file(url, part, total=0, on_progress=None):
+    """ينزّل url إلى الملف part، ويكمل من حيث توقف إن كان جزء منه موجوداً."""
+    have = os.path.getsize(part) if os.path.isfile(part) else 0
+    if total and have > total:
+        have = 0
+    if total and have == total:
+        return
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have and not total:
+            return  # لا يوجد ما يُكمَل — الملف كان قد نزل كاملاً
+        raise
+    with r:
+        if have and r.status != 206:
+            have = 0  # السيرفر لم يقبل الاستكمال — نبدأ من جديد
+        total = total or have + int(r.headers.get("Content-Length") or 0)
+        last = 0
+        with open(part, "ab" if have else "wb") as f:
+            while True:
+                chunk = r.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                have += len(chunk)
+                if on_progress and time.time() - last > 0.3:
+                    last = time.time()
+                    on_progress(have, total)
+
+
+def install_deno(on_progress=None):
+    """ينزّل Deno إلى ~/.viddrop/bin (مرة واحدة) ويرجع مساره."""
+    os.makedirs(BIN_DIR, exist_ok=True)
+    part = os.path.join(BIN_DIR, "deno.zip.part")
+    exe = os.path.join(BIN_DIR, "deno.exe")
+    download_file(DENO_URL, part, 0, on_progress)
+    try:
+        with zipfile.ZipFile(part) as z, z.open("deno.exe") as src, open(exe + ".tmp", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except (zipfile.BadZipFile, KeyError):
+        os.remove(part)  # ملف تالف — يبدأ من جديد في المحاولة القادمة
+        raise
+    os.replace(exe + ".tmp", exe)
+    os.remove(part)
+    return exe
+
+
+def log_error(text):
+    """يحفظ تفاصيل الخطأ في ~/.viddrop/error.log (البرنامج بدون نافذة أوامر تظهر فيها الأخطاء)."""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        if os.path.isfile(ERROR_LOG) and os.path.getsize(ERROR_LOG) > 500_000:
+            os.remove(ERROR_LOG)
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] VidDrop v{APP_VERSION}\n{text.rstrip()}\n")
+    except Exception:
+        pass
+
+
+def already_running():
+    """True إذا كانت نسخة أخرى من البرنامج مفتوحة (Windows) — ويُظهر نافذتها."""
+    if not IS_WINDOWS:
+        return False
+    import ctypes
+    global _instance_mutex
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _instance_mutex = kernel32.CreateMutexW(None, False, "VidDrop_single_instance")
+    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+        return False
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, APP_NAME)
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def can_self_update():
+    """التحديث التلقائي يحتاج صلاحية الكتابة بجانب VidDrop.exe (غير ممكن مثلاً داخل Program Files)."""
+    if not IS_FROZEN:
+        return False
+    probe = os.path.join(os.path.dirname(sys.executable), f".viddrop-{os.getpid()}.tmp")
+    try:
+        open(probe, "w").close()
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def close_splash():
+    """يغلق صورة "جارٍ التشغيل" التي تظهر أثناء فك ملفات VidDrop.exe."""
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
 
 
 def is_online(timeout=3):
@@ -359,7 +492,7 @@ def fetch_latest_release():
     asset = next((a for a in data.get("assets", []) if a.get("name", "").lower() == "viddrop.exe"), None)
     return {
         "version": tag.lstrip("vV"),
-        "notes": (data.get("body") or "").strip(),
+        "notes": (data.get("body") or "").split("\n---")[0].strip(),  # بدون تذييل "طريقة التشغيل"
         "url": asset["browser_download_url"] if asset else "",
         "size": asset.get("size", 0) if asset else 0,
     }
@@ -460,12 +593,19 @@ class VidDropApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(APP_NAME)
-        self.geometry("1180x740")
-        self.minsize(1000, 640)
+        # حجم النافذة لا يتجاوز الشاشة (شاشات صغيرة أو تكبير Windows 125%/150%)
+        scale = ctk.ScalingTracker.get_window_scaling(self)
+        w = int(min(1180, self.winfo_screenwidth() / scale - 40))
+        h = int(min(740, self.winfo_screenheight() / scale - 100))
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(1000, w), min(640, h))
         self.configure(fg_color=BG)
 
         self.ffmpeg = find_ffmpeg()
-        self.has_deno = shutil.which("deno") is not None
+        self.deno = find_deno()
+        self.deno_stage = ""       # downloading / failed
+        self.deno_text = ""
+        self.deno_frac = 0.0
 
         # الحالة
         self.items = [Item(**d) for d in load_json(QUEUE_FILE, []) if d.get("url")]
@@ -496,12 +636,15 @@ class VidDropApp(ctk.CTk):
         self.after(1200, self.poll_clipboard)
         if self.settings["auto_update_check"]:
             self.after(3000, self.start_update_check)
+        if IS_WINDOWS and not self.deno:
+            self.after(1500, self.start_deno_install)
         if IS_FROZEN:  # حذف النسخة القديمة التي تركها التحديث السابق
             try:
                 os.remove(os.path.splitext(sys.executable)[0] + ".old.exe")
             except OSError:
                 pass
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        close_splash()
 
     # ───── أدوات ─────
 
@@ -562,6 +705,7 @@ class VidDropApp(ctk.CTk):
         body = ctk.CTkFrame(root, fg_color="transparent")
         body.pack(fill="both", expand=True, pady=(14, 0))
         self.body = body
+        self.render_deno_bar()
         self.render_update_bar()
         left_col, right_col = (1, 0) if self.rtl else (0, 1)
         body.grid_columnconfigure(left_col, weight=5, uniform="c")
@@ -617,12 +761,13 @@ class VidDropApp(ctk.CTk):
         warnings = []
         if not self.ffmpeg:
             warnings.append(self.t("ffmpeg_missing"))
-        if not self.has_deno:
+        if not self.deno and not IS_WINDOWS:  # على Windows ينزّله البرنامج بنفسه
             warnings.append(self.t("deno_missing"))
         for w in warnings:
             ctk.CTkLabel(root, text=w, font=self.font(12), text_color=WARNING,
                          anchor=self.anchor).pack(fill="x", pady=(8, 0))
 
+        self.deno_bar = ctk.CTkFrame(root, fg_color=CARD, corner_radius=12)    # يظهر أثناء تنزيل Deno
         self.update_bar = ctk.CTkFrame(root, fg_color=CARD, corner_radius=12)  # يظهر عند وجود تحديث
 
     def _build_form(self, form):
@@ -927,6 +1072,8 @@ class VidDropApp(ctk.CTk):
     def _fetch_thread(self, url):
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
                 "logger": _QuietLogger(), "socket_timeout": 20}
+        if self.deno:
+            opts["js_runtimes"] = {"deno": {"path": self.deno}}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1173,6 +1320,8 @@ class VidDropApp(ctk.CTk):
         }
         if ff:
             opts["ffmpeg_location"] = ff
+        if self.deno:
+            opts["js_runtimes"] = {"deno": {"path": self.deno}}
 
         if q == "audio":
             if ff:
@@ -1372,6 +1521,8 @@ class VidDropApp(ctk.CTk):
                     self.on_fetch_error(*ev[1:])
                 elif kind == "update":
                     self.on_update_event(*ev[1:])
+                elif kind == "deno":
+                    self.on_deno_event(*ev[1:])
         except queue.Empty:
             pass
         for it in self.dirty:
@@ -1476,6 +1627,70 @@ class VidDropApp(ctk.CTk):
         except Exception:
             pass
 
+    # ───── تجهيز Deno (مطلوب ليوتيوب) ─────
+
+    def start_deno_install(self):
+        if self.deno or self.deno_stage == "downloading":
+            return
+        self.deno_stage = "downloading"
+        self.deno_frac = 0.0
+        self.deno_text = ""
+        self.render_deno_bar()
+        threading.Thread(target=self._deno_install_thread, daemon=True).start()
+
+    def _deno_install_thread(self):
+        try:
+            path = install_deno(lambda have, total: self.ui_events.put(("deno", "progress", (have, total))))
+            self.ui_events.put(("deno", "ready", path))
+        except Exception:
+            log_error("Deno download failed:\n" + traceback.format_exc())
+            self.ui_events.put(("deno", "failed", ""))
+
+    def on_deno_event(self, stage, data):
+        if stage == "progress":
+            have, total = data
+            self.deno_frac = have / total if total else 0.0
+            self.deno_text = f"{self.deno_frac * 100:.0f}%   ({fmt_bytes(have)} / {fmt_bytes(total)})"
+            if self.deno_stage == "downloading" and self.deno_progress:
+                try:
+                    self.deno_label.configure(text=self.t("deno_downloading", p=self.deno_text))
+                    self.deno_progress.set(self.deno_frac)
+                except TclError:
+                    pass
+            return
+        if stage == "ready":
+            self.deno, self.deno_stage = data, ""
+        elif stage == "failed":
+            self.deno_stage, self.deno_text = "failed", data
+        else:  # "لاحقاً" — يحاول مجدداً عند فتح البرنامج القادم
+            self.deno_stage = ""
+        self.render_deno_bar()
+
+    def render_deno_bar(self):
+        bar = self.deno_bar
+        for w in bar.winfo_children():
+            w.destroy()
+        self.deno_label = self.deno_progress = None
+        if not self.deno_stage:
+            bar.pack_forget()
+            return
+        bar.pack(fill="x", pady=(10, 0), before=self.body)
+        row = ctk.CTkFrame(bar, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=10)
+        if self.deno_stage == "failed":
+            self.small_btn(row, self.t("upd_later"), lambda: self.on_deno_event("hide", ""))
+            self.small_btn(row, self.t("upd_retry"), self.start_deno_install, ACCENT)
+            text, color = self.t("deno_failed"), WARNING
+        else:
+            text, color = self.t("deno_downloading", p=self.deno_text), None
+        self.deno_label = ctk.CTkLabel(row, text=text, font=self.font(13, "bold"), text_color=color,
+                                       anchor=self.anchor)
+        self.deno_label.pack(side=self.side, fill="x", expand=True)
+        if self.deno_stage == "downloading":
+            self.deno_progress = ctk.CTkProgressBar(bar, height=8, progress_color=ACCENT)
+            self.deno_progress.set(self.deno_frac)
+            self.deno_progress.pack(fill="x", padx=14, pady=(0, 12))
+
     # ───── التحديثات ─────
 
     def on_update_toggle(self):
@@ -1523,29 +1738,8 @@ class VidDropApp(ctk.CTk):
             if os.path.isfile(done) and (not total or os.path.getsize(done) == total):
                 self.ui_events.put(("update", "ready", done))  # نزل كاملاً من قبل
                 return
-            have = os.path.getsize(part) if os.path.isfile(part) else 0
-            if total and have > total:
-                have = 0
-            if not (total and have == total):
-                headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
-                if have:
-                    headers["Range"] = f"bytes={have}-"  # يكمل من حيث توقف
-                req = urllib.request.Request(info["url"], headers=headers)
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    if have and r.status != 206:
-                        have = 0  # السيرفر لم يقبل الاستكمال — نبدأ من جديد
-                    total = total or have + int(r.headers.get("Content-Length") or 0)
-                    last = 0
-                    with open(part, "ab" if have else "wb") as f:
-                        while True:
-                            chunk = r.read(64 * 1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            have += len(chunk)
-                            if time.time() - last > 0.3:
-                                last = time.time()
-                                self.ui_events.put(("update", "progress", (have, total)))
+            download_file(info["url"], part, total,
+                          lambda have, total: self.ui_events.put(("update", "progress", (have, total))))
             size = os.path.getsize(part)
             if info["size"] and size != info["size"]:
                 if size > info["size"]:
@@ -1574,7 +1768,7 @@ class VidDropApp(ctk.CTk):
                 return
             self.update_info = data
             done = self.update_paths(data)[0]
-            if IS_FROZEN and data["url"] and os.path.isfile(done) and \
+            if data["url"] and can_self_update() and os.path.isfile(done) and \
                     (not data["size"] or os.path.getsize(done) == data["size"]):
                 stage, self.update_file = "ready", done  # نزل في مرة سابقة
         elif stage == "failed":
@@ -1601,7 +1795,7 @@ class VidDropApp(ctk.CTk):
         if st != "downloading":
             self.small_btn(row, self.t("upd_later"), self.hide_update_bar)
         if st == "available":
-            if IS_FROZEN and self.update_info["url"]:
+            if self.update_info["url"] and can_self_update():
                 self.small_btn(row, self.t("upd_install"), self.start_update_download, ACCENT)
             else:
                 self.small_btn(row, self.t("upd_page"), lambda: webbrowser.open(RELEASES_PAGE), ACCENT)
@@ -1643,13 +1837,16 @@ class VidDropApp(ctk.CTk):
                 f.write(UPDATER_BAT)
             # الأقواس الخارجية الإضافية لأن cmd /c يحذف أول وآخر علامة تنصيص
             subprocess.Popen(f'cmd /c ""{bat}" "{sys.executable}" "{self.update_file}""',
-                             env=child_env(), creationflags=0x08000000)  # CREATE_NO_WINDOW
+                             env=child_env(), creationflags=NO_WINDOW)
         except Exception as e:
             self.on_update_event("failed", clean_error(e))
             return
         self.on_close()
 
     # ───── الإغلاق ─────
+
+    def report_callback_exception(self, exc, val, tb):
+        log_error("".join(traceback.format_exception(exc, val, tb)))
 
     def on_close(self):
         self.save_queue()
@@ -1658,7 +1855,132 @@ class VidDropApp(ctk.CTk):
         os._exit(0)  # ينهي خيوط التحميل؛ الملفات الجزئية تبقى ويكمل منها لاحقاً
 
 
-if __name__ == "__main__":
+# ─────────────────────────── الفحص الذاتي ───────────────────────────
+
+def selftest(report_path):
+    """
+    VidDrop.exe --selftest report.json
+    يُشغَّل على GitHub قبل نشر كل نسخة: يتأكد أن FFmpeg و Deno و yt-dlp تعمل من داخل البرنامج،
+    وأن تحميل فيديو وتحويله إلى MP3 يكتمل عبر قائمة التحميل الحقيقية. لا يلمس إعدادات المستخدم.
+    """
+    import functools
+    import http.server
+
+    work = tempfile.mkdtemp(prefix="viddrop-selftest-")
+    set_config_dir(os.path.join(work, "config"))
+    out = os.path.join(work, "out")
+    report = {"version": APP_VERSION, "frozen": IS_FROZEN, "yt_dlp": yt_dlp.version.__version__}
+    failed = []
+
+    def check(name, fn, fatal=True):
+        try:
+            report[name] = fn()
+        except Exception as e:
+            report[name] = f"FAILED: {type(e).__name__}: {e}"
+            if fatal:
+                failed.append(name)
+
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=180,
+                           creationflags=NO_WINDOW)
+        if r.returncode:
+            raise RuntimeError(r.stderr.decode(errors="replace")[-300:])
+        return r.stdout.decode(errors="replace")
+
+    def ffmpeg_check():
+        return run([find_ffmpeg(), "-version"]).splitlines()[0]
+
+    def deno_check():
+        if not IS_WINDOWS:
+            return "skipped (not Windows)"
+        return run([install_deno(), "--version"]).splitlines()[0]
+
+    def make_samples():
+        for name in ("video.mp4", "audio.mp4"):
+            run([find_ffmpeg(), "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=15",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                 "-c:v", "mpeg4", "-c:a", "aac", "-shortest", os.path.join(work, name)])
+        return "ok"
+
+    def queue_check():
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=work))
+        srv.handle_error = lambda *args: None  # yt-dlp يقطع بعض الطلبات عمداً
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}/"
+        save_json(SETTINGS_FILE, {"clipboard": False, "auto_update_check": False, "folder": out})
+        app = VidDropApp()
+        opts = {"sub_type": "none", "sub_lang": None, "sub_fmt": "srt", "sub_mode": "file", "folder": out}
+        app.add_item(base + "video.mp4", "selftest video", {**opts, "quality": "best"})
+        app.add_item(base + "audio.mp4", "selftest audio", {**opts, "quality": "audio"})
+        deadline = time.time() + 180
+
+        def poll():
+            if all(i.status in ("done", "error") for i in app.items) or time.time() > deadline:
+                app.quit()
+            else:
+                app.after(300, poll)
+
+        app.after(300, poll)
+        app.mainloop()
+        result = {i.title: f"{i.status} {i.error} {os.path.basename(i.filepath)}".strip() for i in app.items}
+        exts = sorted(os.path.splitext(i.filepath)[1] for i in app.items
+                      if i.status == "done" and os.path.isfile(i.filepath))
+        if exts != [".mp3", ".mp4"]:
+            raise RuntimeError(str(result))
+        return result
+
+    def youtube_check():
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger(),
+                "socket_timeout": 20}
+        if find_deno():
+            opts["js_runtimes"] = {"deno": {"path": find_deno()}}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info("https://www.youtube.com/watch?v=jNQXAC9IVRw", download=False)
+        heights = sorted({f["height"] for f in info["formats"] if f.get("height")})
+        return f"{len(info['formats'])} formats, heights {heights}"
+
+    check("ffmpeg", ffmpeg_check)
+    check("deno", deno_check)
+    check("samples", make_samples)
+    check("queue", queue_check)
+    check("youtube (info only)", youtube_check, fatal=False)  # يوتيوب قد يحظر سيرفرات GitHub
+    report["result"] = "FAILED: " + ", ".join(failed) if failed else "PASSED"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    shutil.rmtree(work, ignore_errors=True)
+    return 1 if failed else 0
+
+
+# ─────────────────────────── التشغيل ───────────────────────────
+
+def main():
+    if "--selftest" in sys.argv:
+        path = (sys.argv[sys.argv.index("--selftest") + 1:] or ["viddrop-selftest.json"])[0]
+        os._exit(selftest(path))
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    app = VidDropApp()
-    app.mainloop()
+    threading.excepthook = lambda a: log_error(
+        "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+    if already_running():
+        return
+    VidDropApp().mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        log_error(traceback.format_exc())
+        close_splash()
+        msg = ("حدث خطأ غير متوقع وتوقف البرنامج.\nتفاصيل الخطأ محفوظة في الملف:\n"
+               f"{ERROR_LOG}\n\nVidDrop stopped because of an unexpected error.\n"
+               "The details were saved to the file above.")
+        if IS_WINDOWS:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, APP_NAME, 0x10)
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(1)

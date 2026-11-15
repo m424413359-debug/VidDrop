@@ -9,12 +9,12 @@ echo.
 echo [1/3] Installing PyInstaller...
 python -m pip install -U pyinstaller
 echo.
-echo [2/3] Creating icon...
+echo [2/3] Creating icon and splash image...
 python make_icon.py
 echo.
 echo [3/3] Building (this takes 1-3 minutes)...
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name VidDrop --icon icon.ico ^
+  --name VidDrop --icon icon.ico --splash splash.png ^
   --collect-all customtkinter ^
   --collect-all imageio_ffmpeg ^
   --collect-all yt_dlp_ejs ^
